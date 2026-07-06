@@ -491,9 +491,25 @@ impl DisplayCatalogHandler {
 
     fn build_client(config: &ClientConfig) -> reqwest::Client {
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = reqwest::Client::builder()
-            .user_agent(&config.user_agent)
-            .timeout(config.timeout);
+        let builder = {
+            let mut b = reqwest::Client::builder()
+                .user_agent(&config.user_agent)
+                .timeout(config.timeout);
+            // fe3.delivery.mp.microsoft.com's cert chains to "Microsoft Root
+            // Certificate Authority 2011", a Microsoft-internal root that
+            // ships with Windows Update but is absent from the Mozilla
+            // webpki-roots and the default Ubuntu CA bundle. Without it, FE3
+            // SOAP calls fail with UnknownIssuer / "unable to get local
+            // issuer certificate" on Linux CI. Bundle the root so trust is
+            // portable across every OS. displaycatalog.mp.microsoft.com
+            // chains to DigiCert Global Root G2 and is unaffected.
+            const MS_ROOT_CA_2011_PEM: &[u8] =
+                include_bytes!("../../data/ms_root_ca_2011.pem");
+            if let Ok(cert) = reqwest::Certificate::from_pem(MS_ROOT_CA_2011_PEM) {
+                b = b.add_root_certificate(cert);
+            }
+            b
+        };
         #[cfg(target_arch = "wasm32")]
         let builder = reqwest::Client::builder().user_agent(&config.user_agent);
         builder.build().unwrap_or_default()

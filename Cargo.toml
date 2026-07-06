@@ -33,7 +33,18 @@ event-listener = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# Use rustls with the bundled Mozilla webpki roots so TLS trust is identical
+# on every OS and does not depend on the runner's system CA bundle. See
+# `build_client` in services/display_catalog.rs for the extra Microsoft root
+# bundled to reach fe3.delivery.mp.microsoft.com.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "charset",
+    "http2",
+    "macos-system-configuration",
+] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
