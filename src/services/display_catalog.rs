@@ -503,8 +503,7 @@ impl DisplayCatalogHandler {
             // issuer certificate" on Linux CI. Bundle the root so trust is
             // portable across every OS. displaycatalog.mp.microsoft.com
             // chains to DigiCert Global Root G2 and is unaffected.
-            const MS_ROOT_CA_2011_PEM: &[u8] =
-                include_bytes!("../../data/ms_root_ca_2011.pem");
+            const MS_ROOT_CA_2011_PEM: &[u8] = include_bytes!("../../data/ms_root_ca_2011.pem");
             if let Ok(cert) = reqwest::Certificate::from_pem(MS_ROOT_CA_2011_PEM) {
                 b = b.add_root_certificate(cert);
             }
