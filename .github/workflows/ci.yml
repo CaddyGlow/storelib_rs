@@ -83,9 +83,14 @@ jobs:
 
   live:
     name: Live Microsoft Store API tests
-    # Network-dependent (#[ignore] by default). Run only on a schedule or on
-    # demand so flaky/changing upstream responses never block PRs.
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Network-dependent (#[ignore] by default). Run only on a schedule, on
+    # demand, or when a push carries the opt-in `<!test_live_apis!>` sigil at
+    # the end of the head commit message, so flaky/changing upstream
+    # responses never block ordinary PRs.
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'push' && endsWith(github.event.head_commit.message, '<!test_live_apis!>'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
