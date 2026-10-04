@@ -437,6 +437,30 @@ custom TLS/proxy clients; callers must preserve certificate verification and saf
 redirect policy. The catalog helper inherits its handler's HTTP policy. Temporary
 URLs are redacted in debug output and excluded from serializable file metadata.
 
+`SfsClient::download_verified(&identity, file_id, max_bytes, cancel)` downloads
+one exact file into bounded memory and returns bytes only after checking its size
+and SHA-256. SHA-256 is required. HTTP 401/403 refreshes its exact file location
+once, requiring the same file ID, size, and digest. Interrupted transfers, changed
+metadata, timeouts, and cancellation return errors without accepting partial bytes.
+Other payload HTTP failures are returned without download retries. Use a modest
+explicit memory bound; this is not a streaming-to-disk or resumable downloader.
+The default client refuses redirects; custom clients must also disable redirects.
+
+To acquire amd64/neutral Terminal candidates and declared prerequisite candidates:
+
+```sh
+cargo run --locked --example sfs_acquire -- /path/to/new-directory 9N0DX20HK701
+```
+
+The parent directory must exist and the output directory must be new. The example
+limits each file to 256 MiB, checks downloaded bytes against the original selected
+metadata, and writes packages plus a URL-free `manifest.json` using exclusive file
+creation. It fails rather than overwriting existing evidence. Candidate filenames
+use `.appx`; inspect their manifests to establish package/bundle type and select
+an installable set. The example does not resolve Windows compatibility or licenses.
+On failure, retain the output directory as incomplete evidence; a manifest is
+written only after all selected downloads succeed.
+
 ## License
 
 This program is free software: you can redistribute it and/or modify it under the terms of the

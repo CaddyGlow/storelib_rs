@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use futures_util::future::{select, Either};
 use reqwest::{Method, Url};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::display_catalog::ClientConfig;
 use crate::cancellation::CancellationToken;
@@ -100,6 +101,18 @@ pub enum SfsError {
     /// Cancelled request or backoff.
     #[error("SFS operation cancelled")]
     Cancelled,
+    /// The requested file no longer exists, or refresh changed its expected bytes.
+    #[error("SFS file identity changed during location refresh")]
+    FileChanged,
+    /// Download exceeds the caller's explicit memory bound.
+    #[error("SFS download exceeds {limit} bytes")]
+    DownloadTooLarge {
+        /// Configured download limit.
+        limit: usize,
+    },
+    /// Completed download does not match its expected size or SHA-256.
+    #[error("SFS downloaded bytes do not match file metadata")]
+    DownloadMismatch,
 }
 
 /// Exact SFS content identity; its version is opaque, not a package version.
@@ -248,6 +261,101 @@ pub struct SfsClient {
 }
 
 impl SfsClient {
+    /// Download one exact file into bounded memory and verify its size and SHA-256.
+    ///
+    /// Refreshes exact file locations once after HTTP 401/403. The refreshed
+    /// file must retain its file ID, size, and SHA-256. Other HTTP failures and
+    /// interrupted transfers are returned without accepting partial bytes.
+    /// The default client refuses redirects; custom clients must do so too. This method does
+    /// not write files; use a modest explicit `max_bytes` for package inspection.
+    pub async fn download_verified(
+        &self,
+        identity: &SfsContentId,
+        file_id: &str,
+        max_bytes: usize,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<Vec<u8>, SfsError> {
+        cancellable(
+            async {
+                if max_bytes == 0 {
+                    return Err(SfsError::InvalidInput("download limit must be positive"));
+                }
+                let mut file = self
+                    .files(identity)
+                    .await?
+                    .into_iter()
+                    .find(|file| file.metadata.file_id == file_id)
+                    .ok_or(SfsError::FileChanged)?;
+                let expected_size = file.metadata.size_in_bytes;
+                let expected_hash = file.metadata.sha256_hex().ok_or(SfsError::InvalidResponse(
+                    "SHA-256 required for verified download",
+                ))?;
+                if expected_size > max_bytes as u64 {
+                    return Err(SfsError::DownloadTooLarge { limit: max_bytes });
+                }
+                for attempt in 0..=1 {
+                    let mut response = self
+                        .client
+                        .get(file.download_url.as_str())
+                        .timeout(self.config.http.timeout)
+                        .header(reqwest::header::ACCEPT_ENCODING, "identity")
+                        .send()
+                        .await
+                        .map_err(transport_error)?;
+                    // Reject an unexpected final location in addition to the default no-redirect policy.
+                    if response.url().as_str() != file.download_url.as_str() {
+                        return Err(SfsError::InvalidResponse("download redirected"));
+                    }
+                    if matches!(response.status().as_u16(), 401 | 403) && attempt == 0 {
+                        drop(response);
+                        file = self
+                            .files(identity)
+                            .await?
+                            .into_iter()
+                            .find(|file| file.metadata.file_id == file_id)
+                            .ok_or(SfsError::FileChanged)?;
+                        if file.metadata.size_in_bytes != expected_size
+                            || file.metadata.sha256_hex().as_deref() != Some(&expected_hash)
+                        {
+                            return Err(SfsError::FileChanged);
+                        }
+                        continue;
+                    }
+                    if !response.status().is_success() {
+                        return Err(SfsError::Http {
+                            status: response.status().as_u16(),
+                            retry_after: None,
+                        });
+                    }
+                    if response
+                        .content_length()
+                        .is_some_and(|size| size > max_bytes as u64)
+                    {
+                        return Err(SfsError::DownloadTooLarge { limit: max_bytes });
+                    }
+                    let mut bytes = Vec::new();
+                    let mut digest = Sha256::new();
+                    while let Some(chunk) = response.chunk().await.map_err(transport_error)? {
+                        if chunk.len() > max_bytes.saturating_sub(bytes.len()) {
+                            return Err(SfsError::DownloadTooLarge { limit: max_bytes });
+                        }
+                        digest.update(&chunk);
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if bytes.len() as u64 != expected_size
+                        || format!("{:x}", digest.finalize()) != expected_hash
+                    {
+                        return Err(SfsError::DownloadMismatch);
+                    }
+                    return Ok(bytes);
+                }
+                Err(SfsError::FileChanged)
+            },
+            cancel,
+        )
+        .await
+    }
+
     /// Construct a client for Store apps using the default policy.
     pub fn new() -> Result<Self, SfsError> {
         Self::with_config(SfsConfig::default())
