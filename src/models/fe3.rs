@@ -127,12 +127,16 @@ pub struct ResolvedFileLocation {
 #[serde(rename_all = "camelCase")]
 pub struct PackageInstance {
     pub package_moniker: String,
-    /// Primary download URL (the first non-blockmap URL returned by FE3).
+    /// Primary download URL matched by update identity and file digest.
+    /// `None` if the identity or digest cannot be matched. When no digest is
+    /// available, a URL is selected only if the update has one file location.
     /// See [`Self::all_file_locations`] for *all* URLs FE3 returned,
     /// including blockmaps and signed/secured alternatives.
     pub package_uri: Option<String>,
     pub package_type: PackageType,
     pub applicability_blob: Option<ApplicabilityBlob>,
+    /// The owning update's GUID, parsed from its `UpdateIdentity` element.
+    /// Empty when the metadata does not contain an owning identity.
     pub update_id: String,
     /// Download size in bytes. Sourced from `<File Size="">` (SyncUpdates)
     /// for the primary binary, falling back to `<ExtendedProperties

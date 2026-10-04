@@ -194,11 +194,11 @@ impl FE3Handler {
             }
 
             // SecuredFragment -> parent (Properties) -> parent (Xml/Update element)
-            // -> first_child (UpdateIdentity)
-            let identity = node
-                .parent()
-                .and_then(|p| p.parent())
-                .and_then(|gp| gp.first_element_child());
+            // -> direct UpdateIdentity child (element order is not identity).
+            let identity = node.parent().and_then(|p| p.parent()).and_then(|gp| {
+                gp.children()
+                    .find(|child| child.tag_name().name() == "UpdateIdentity")
+            });
 
             if let Some(identity) = identity {
                 if let (Some(uid), Some(rev)) = (
@@ -445,6 +445,10 @@ impl FE3Handler {
                 x.children()
                     .find(|c| c.tag_name().name() == "UpdateIdentity")
             });
+            let update_id = own_identity
+                .and_then(|n| n.attribute("UpdateID"))
+                .unwrap_or_default()
+                .to_owned();
             let revision_number = own_identity
                 .and_then(|n| n.attribute("RevisionNumber"))
                 .map(String::from);
@@ -657,7 +661,7 @@ impl FE3Handler {
                 package_uri: None,
                 package_type: pkg_type,
                 applicability_blob: blob,
-                update_id: String::new(),
+                update_id,
                 file_size,
                 file_name: file_name.map(String::from),
                 readable_file_name,
@@ -1089,6 +1093,41 @@ mod tests {
     </Xml>
   </UpdateInfo>
 </root>"#;
+
+    #[tokio::test]
+    async fn package_identity_comes_from_its_own_update() {
+        let xml = r#"<root>
+          <UpdateInfo><Xml>
+            <UpdateIdentity UpdateID="non-package" RevisionNumber="1"/>
+            <Properties><SecuredFragment/></Properties>
+          </Xml></UpdateInfo>
+          <UpdateInfo><Xml>
+            <UpdateIdentity UpdateID="package-owner" RevisionNumber="7"/>
+            <Properties><SecuredFragment/></Properties>
+            <Metadata>
+              <AppxMetadata PackageMoniker="App.A" PackageType="AppX" IsAppxBundle="false">{}</AppxMetadata>
+              <AppxMetadata PackageMoniker="App.B" PackageType="AppX" IsAppxBundle="false">{}</AppxMetadata>
+            </Metadata>
+          </Xml></UpdateInfo>
+        </root>"#;
+        let packages = FE3Handler::get_package_instances(xml).await.unwrap();
+        assert_eq!(packages.len(), 2);
+        for package in packages {
+            assert_eq!(package.update_id, "package-owner");
+            assert_eq!(package.revision_number.as_deref(), Some("7"));
+        }
+    }
+
+    #[test]
+    fn process_update_ids_does_not_require_identity_to_be_first_child() {
+        let xml = r#"<root><Xml>
+          <Properties><SecuredFragment/></Properties>
+          <UpdateIdentity UpdateID="owner" RevisionNumber="7"/>
+        </Xml></root>"#;
+        let (ids, revisions) = FE3Handler::process_update_ids(xml).unwrap();
+        assert_eq!(ids, ["owner"]);
+        assert_eq!(revisions, ["7"]);
+    }
 
     #[tokio::test]
     async fn get_package_instances_extracts_prerequisites() {

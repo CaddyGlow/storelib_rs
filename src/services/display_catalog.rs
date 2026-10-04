@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use crate::models::catalog::{
     Price, Product, ProductLocalizedProperty, Sku,
 };
 use crate::models::enums::{DCatEndpoint, DeviceFamily, DisplayCatalogResult, IdentifierType};
-use crate::models::fe3::PackageInstance;
+use crate::models::fe3::{PackageInstance, ResolvedFileLocation};
 use crate::models::locale::Locale;
 use crate::models::search::DCatSearch;
 use crate::services::fe3::FE3Handler;
@@ -202,6 +203,50 @@ where
     Err(last_err.unwrap_or_else(|| StoreError::Other("retries exhausted".into())))
 }
 
+/// Join independently parsed packages and file locations by update identity.
+/// The low-level FE3 response is ordered by request, not by package metadata.
+fn attach_file_locations(
+    packages: &mut [PackageInstance],
+    update_ids: &[String],
+    revision_ids: &[String],
+    locations: &[Vec<ResolvedFileLocation>],
+) -> Result<(), StoreError> {
+    if update_ids.len() != revision_ids.len() || update_ids.len() != locations.len() {
+        return Err(StoreError::Other(
+            "FE3 file-location response count does not match update requests".into(),
+        ));
+    }
+    let mut by_update: HashMap<(&str, &str), Vec<ResolvedFileLocation>> = HashMap::new();
+    for ((id, revision), files) in update_ids.iter().zip(revision_ids).zip(locations) {
+        by_update
+            .entry((id.as_str(), revision.as_str()))
+            .or_default()
+            .extend_from_slice(files);
+    }
+    for package in packages {
+        let files = package
+            .revision_number
+            .as_deref()
+            .filter(|revision| !revision.is_empty() && !package.update_id.is_empty())
+            .and_then(|revision| by_update.get(&(package.update_id.as_str(), revision)))
+            .cloned()
+            .unwrap_or_default();
+        // A blockmap or another package's binary is not a substitute for a
+        // missing digest match. Without a digest, only a single location is
+        // unambiguous within the update.
+        package.package_uri = match package.digest.as_deref() {
+            Some(digest) => files
+                .iter()
+                .find(|file| file.digest.as_deref() == Some(digest)),
+            None if files.len() == 1 => files.first(),
+            None => None,
+        }
+        .map(|file| file.url.clone());
+        package.all_file_locations = files;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Progress reporting
 // ---------------------------------------------------------------------------
@@ -293,6 +338,8 @@ pub struct DisplayCatalogHandler {
     pub selected_locale: Locale,
     pub is_found: bool,
     client: reqwest::Client,
+    #[cfg(test)]
+    catalog_url_override: Option<String>,
     pub(crate) config: ClientConfig,
     /// Subscribe with `handler.progress.set(Box::new(|e| ...))`.
     pub progress: ProgressEmitter,
@@ -320,6 +367,8 @@ impl DisplayCatalogHandler {
             selected_locale: locale,
             is_found: false,
             client,
+            #[cfg(test)]
+            catalog_url_override: None,
             config,
             progress: ProgressEmitter::new(),
         }
@@ -543,7 +592,16 @@ impl DisplayCatalogHandler {
         auth_token: Option<&str>,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), StoreError> {
+        self.begin_product_query(Some(id));
         race_cancel(self.query_dcat_inner(id, id_type, auth_token), cancel).await
+    }
+
+    fn begin_product_query(&mut self, id: Option<&str>) {
+        self.id = id.map(str::to_owned);
+        self.product_listing = None;
+        self.result = None;
+        self.is_found = false;
+        self.error = None;
     }
 
     async fn query_dcat_inner(
@@ -552,11 +610,9 @@ impl DisplayCatalogHandler {
         id_type: IdentifierType,
         auth_token: Option<&str>,
     ) -> Result<(), StoreError> {
-        self.id = Some(id.to_owned());
-        self.result = None;
-        self.is_found = false;
-
         let url = create_dcat_uri(&self.selected_endpoint, id, &id_type, &self.selected_locale);
+        #[cfg(test)]
+        let url = self.catalog_url_override.as_ref().unwrap_or(&url).clone();
         debug!("DCat query: GET {url}");
         self.progress.emit("dcat.request", format!("GET id={id}"));
 
@@ -676,6 +732,7 @@ impl DisplayCatalogHandler {
         auth_token: Option<&str>,
         cancel: Option<&CancellationToken>,
     ) -> Result<(), StoreError> {
+        self.begin_product_query(None);
         race_cancel(self.query_dcat_batch_inner(ids, auth_token), cancel).await
     }
 
@@ -690,15 +747,13 @@ impl DisplayCatalogHandler {
             ));
         }
 
-        self.id = None;
-        self.result = None;
-        self.is_found = false;
-
         let url = crate::utilities::helpers::create_dcat_batch_uri(
             &self.selected_endpoint,
             ids,
             &self.selected_locale,
         );
+        #[cfg(test)]
+        let url = self.catalog_url_override.as_ref().unwrap_or(&url).clone();
         debug!("DCat batch query: GET {url}");
         self.progress
             .emit("dcat.request", format!("batch GET ({} ids)", ids.len()));
@@ -793,6 +848,11 @@ impl DisplayCatalogHandler {
         &self,
         msa_token: Option<&str>,
     ) -> Result<Vec<PackageInstance>, StoreError> {
+        if !self.is_found {
+            return Err(StoreError::Other(
+                "Cannot get packages: no successful product lookup.".into(),
+            ));
+        }
         let product = self.product().ok_or_else(|| {
             StoreError::Other("Cannot get packages: product data is null.".into())
         })?;
@@ -862,7 +922,7 @@ impl DisplayCatalogHandler {
         // to the package row it belongs to.
         let total_pkgs = instances.len() as u32;
         for (i, inst) in instances.iter().enumerate() {
-            let uid = update_ids.get(i).map(String::as_str).unwrap_or("");
+            let uid = &inst.update_id;
             self.progress.emit_counter(
                 "fe3.packageFound",
                 format!(
@@ -881,13 +941,21 @@ impl DisplayCatalogHandler {
             format!("resolving {} URLs", update_ids.len()),
         );
 
-        // Build update_id → moniker lookup so the per-link callback can
-        // attach the owning package's moniker to each live URL event.
-        let moniker_by_update_id: std::collections::HashMap<&str, &str> = update_ids
-            .iter()
-            .zip(instances.iter())
-            .map(|(uid, inst)| (uid.as_str(), inst.package_moniker.as_str()))
-            .collect();
+        // An update can own several packages, and the same GUID can occur
+        // with different revisions. Only label a link with a package name
+        // when both the owning update and the binary digest match.
+        let mut monikers_by_file: HashMap<(&str, &str, &str), Vec<&str>> = HashMap::new();
+        for instance in &instances {
+            if let (Some(revision), Some(digest)) = (
+                instance.revision_number.as_deref(),
+                instance.digest.as_deref(),
+            ) {
+                monikers_by_file
+                    .entry((&instance.update_id, revision, digest))
+                    .or_default()
+                    .push(&instance.package_moniker);
+            }
+        }
 
         // Stream a `fe3.linkReceived` event the moment each <FileLocation>
         // is parsed (i.e. before the next request goes out), enriched with
@@ -902,20 +970,26 @@ impl DisplayCatalogHandler {
             msa_token,
             &self.client,
             |idx, total, update_id, loc| {
-                let moniker = moniker_by_update_id
-                    .get(update_id)
-                    .copied()
-                    .unwrap_or("<unknown>");
-                progress.emit_counter(
-                    "fe3.linkReceived",
-                    format!(
-                        "{moniker} | uri={} | digest={} | updateId={update_id}",
-                        loc.url,
-                        loc.digest.as_deref().unwrap_or("?"),
-                    ),
-                    (idx + 1) as u32,
-                    total as u32,
-                );
+                let monikers = revision_ids
+                    .get(idx)
+                    .zip(loc.digest.as_deref())
+                    .and_then(|(revision, digest)| {
+                        monikers_by_file.get(&(update_id, revision.as_str(), digest))
+                    })
+                    .map(Vec::as_slice)
+                    .unwrap_or(&["<unknown>"]);
+                for moniker in monikers {
+                    progress.emit_counter(
+                        "fe3.linkReceived",
+                        format!(
+                            "{moniker} | uri={} | digest={} | updateId={update_id}",
+                            loc.url,
+                            loc.digest.as_deref().unwrap_or("?"),
+                        ),
+                        (idx + 1) as u32,
+                        total as u32,
+                    );
+                }
             },
         )
         .await?;
@@ -962,26 +1036,8 @@ impl DisplayCatalogHandler {
             debug!("  FE3 moniker: {}", inst.package_moniker);
         }
 
+        attach_file_locations(&mut instances, &update_ids, &revision_ids, &per_update_locs)?;
         for (i, instance) in instances.iter_mut().enumerate() {
-            instance.update_id = update_ids.get(i).cloned().unwrap_or_default();
-
-            // Attach every <FileLocation> FE3 returned for this update.
-            let locs = per_update_locs.get(i).cloned().unwrap_or_default();
-
-            // Pick the primary download URL: prefer the one whose FileDigest
-            // matches the binary's <File Digest>, fall back to the first
-            // location. This is more robust than the legacy 99-char URL
-            // heuristic and correctly handles signed/secured alt URLs.
-            instance.package_uri = match instance.digest.as_deref() {
-                Some(want) => locs
-                    .iter()
-                    .find(|l| l.digest.as_deref() == Some(want))
-                    .map(|l| l.url.clone())
-                    .or_else(|| locs.first().map(|l| l.url.clone())),
-                None => locs.first().map(|l| l.url.clone()),
-            };
-            instance.all_file_locations = locs;
-
             // file_size is already populated by the parser from <File Size>
             // / <ExtendedProperties MaxDownloadSize>. Only fall back to
             // DCat when both are missing (rare; mainly for old framework
@@ -1517,6 +1573,267 @@ mod tests {
     }
 
     // -- batch query (wiremock-backed) ---------------------------------------
+
+    fn package_with_identity(id: &str, revision: &str, digest: Option<&str>) -> PackageInstance {
+        PackageInstance {
+            update_id: id.into(),
+            revision_number: Some(revision.into()),
+            digest: digest.map(str::to_owned),
+            ..Default::default()
+        }
+    }
+
+    fn file_location(name: &str) -> ResolvedFileLocation {
+        ResolvedFileLocation {
+            url: format!("https://example.invalid/{name}"),
+            digest: Some(name.into()),
+        }
+    }
+
+    #[test]
+    fn file_locations_match_identity_revision_and_digest_not_package_order() {
+        let mut packages = [
+            package_with_identity("app", "7", Some("first-binary")),
+            package_with_identity("app", "7", Some("second-binary")),
+            package_with_identity("app", "8", Some("new-binary")),
+        ];
+        // Requests differ from package order and include a non-package update.
+        let ids = ["app".into(), "category".into(), "app".into()];
+        let revisions = ["8".into(), "1".into(), "7".into()];
+        let locations = [
+            vec![file_location("new-binary")],
+            vec![file_location("unrelated")],
+            vec![
+                file_location("blockmap"),
+                file_location("second-binary"),
+                file_location("first-binary"),
+            ],
+        ];
+        attach_file_locations(&mut packages, &ids, &revisions, &locations).unwrap();
+        for (package, expected) in
+            packages
+                .iter()
+                .zip(["first-binary", "second-binary", "new-binary"])
+        {
+            assert_eq!(package.package_uri, Some(file_location(expected).url));
+            assert_eq!(package.update_id, "app");
+        }
+        assert_eq!(packages[0].all_file_locations.len(), 3);
+        assert_eq!(packages[2].revision_number.as_deref(), Some("8"));
+    }
+
+    #[test]
+    fn unmatched_identity_or_digest_never_falls_back_to_another_file() {
+        let mut packages = [
+            package_with_identity("unknown", "1", Some("binary")),
+            package_with_identity("app", "2", Some("binary")),
+            package_with_identity("app", "1", Some("missing-digest")),
+            package_with_identity("", "1", Some("binary")),
+            PackageInstance {
+                update_id: "app".into(),
+                ..Default::default()
+            },
+        ];
+        for package in &mut packages {
+            package.package_uri = Some("https://example.invalid/stale".into());
+        }
+        attach_file_locations(
+            &mut packages,
+            &["app".into()],
+            &["1".into()],
+            &[vec![file_location("binary")]],
+        )
+        .unwrap();
+        assert!(packages.iter().all(|p| p.package_uri.is_none()));
+        assert!(packages[0].all_file_locations.is_empty());
+    }
+
+    #[test]
+    fn missing_digest_only_selects_an_unambiguous_location() {
+        let mut packages = [package_with_identity("app", "1", None)];
+        attach_file_locations(
+            &mut packages,
+            &["app".into()],
+            &["1".into()],
+            &[vec![file_location("binary"), file_location("blockmap")]],
+        )
+        .unwrap();
+        assert!(packages[0].package_uri.is_none());
+        attach_file_locations(
+            &mut packages,
+            &["app".into()],
+            &["1".into()],
+            &[vec![file_location("binary")]],
+        )
+        .unwrap();
+        assert_eq!(packages[0].package_uri, Some(file_location("binary").url));
+    }
+
+    #[test]
+    fn file_location_join_rejects_inconsistent_response_counts() {
+        let mut packages = [package_with_identity("app", "1", Some("binary"))];
+        assert!(attach_file_locations(&mut packages, &["app".into()], &[], &[]).is_err());
+        assert!(attach_file_locations(&mut packages, &["app".into()], &["1".into()], &[]).is_err());
+    }
+
+    async fn loaded_handler(server: &MockServer) -> DisplayCatalogHandler {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"Product":{"ProductId":"old-product","LocalizedProperties":[{"ProductTitle":"Old product"}]}}"#,
+            ))
+            .expect(1)
+            .mount(server)
+            .await;
+        let mut handler = DisplayCatalogHandler::with_config(
+            DCatEndpoint::Production,
+            Locale::production(),
+            ClientConfig {
+                max_retries: 0,
+                ..Default::default()
+            },
+        );
+        handler.catalog_url_override = Some(server.uri());
+        handler
+            .query_dcat("old-product", IdentifierType::ProductId, None)
+            .await
+            .unwrap();
+        assert_eq!(handler.title(), Some("Old product"));
+        server.reset().await;
+        handler
+    }
+
+    async fn assert_lookup_cleared(handler: &DisplayCatalogHandler) {
+        assert!(handler.product_listing.is_none());
+        assert!(handler.product().is_none());
+        assert!(handler.products().is_empty());
+        assert!(!handler.is_found);
+        assert!(handler.get_packages_for_product(None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_product_lookup_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let err = handler
+            .query_dcat("missing", IdentifierType::ProductId, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound));
+        assert_eq!(handler.id.as_deref(), Some("missing"));
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn malformed_product_response_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(handler
+            .query_dcat("broken", IdentifierType::ProductId, None)
+            .await
+            .is_err());
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn failed_batch_lookup_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(1)
+            .mount(&server)
+            .await;
+        assert!(handler.query_dcat_batch(&["new"], None).await.is_err());
+        assert!(handler.id.is_none());
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn empty_batch_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        assert!(handler.query_dcat_batch(&[], None).await.is_err());
+        assert!(handler.id.is_none());
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_product_lookup_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = handler
+            .query_dcat_with_cancel("new", IdentifierType::ProductId, None, Some(&token))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Cancelled));
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_batch_lookup_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        let token = CancellationToken::new();
+        token.cancel();
+        let err = handler
+            .query_dcat_batch_with_cancel(&["new"], None, Some(&token))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Cancelled));
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_lookup_clears_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+        let result = tokio::time::timeout(
+            Duration::from_millis(30),
+            handler.query_dcat("slow", IdentifierType::ProductId, None),
+        )
+        .await;
+        assert!(result.is_err());
+        assert_lookup_cleared(&handler).await;
+    }
+
+    #[tokio::test]
+    async fn successful_lookup_replaces_previous_product() {
+        let server = MockServer::start().await;
+        let mut handler = loaded_handler(&server).await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"Product":{"ProductId":"new-product"}}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        handler
+            .query_dcat("new-product", IdentifierType::ProductId, None)
+            .await
+            .unwrap();
+        assert!(handler.is_found);
+        assert_eq!(
+            handler.product().unwrap().product_id.as_deref(),
+            Some("new-product")
+        );
+    }
 
     #[tokio::test]
     async fn query_dcat_batch_rejects_empty_ids() {

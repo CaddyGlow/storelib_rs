@@ -4,6 +4,20 @@ A Rust port of [StoreLib](https://github.com/query-store-links/StoreLib) — a l
 
 Supports native (tokio), **WebAssembly**, and **C / FFI** targets.
 
+## Fork fixes
+
+This fork fixes package identity matching and stale product state:
+
+- FE3 packages retain their owning update ID and revision. Download locations
+  are joined by that identity and selected by file digest, independently of
+  response order. Missing matches leave `package_uri` as `None`; without a
+  digest, only an update with one location supplies a primary URL.
+- Starting a single or batch product lookup clears the previous listing.
+  Errors, invalid input, and cancellation cannot leave the previous product
+  available for package resolution. Resolution requires a successful lookup.
+
+The upstream GPL-3.0-only license is retained.
+
 ## Features
 
 - Query the Microsoft Store Display Catalog by Product ID, Package Family Name, Xbox Title ID, and more
