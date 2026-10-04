@@ -30,6 +30,7 @@ roxmltree = "0.20"
 uuid = { version = "1", features = ["v4", "js"] }
 log = "0.4"
 event-listener = "5"
+httpdate = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

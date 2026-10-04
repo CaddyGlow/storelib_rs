@@ -61,6 +61,11 @@ pub use services::display_catalog::{
     ClientConfig, DisplayCatalogHandler, ProgressCallback, ProgressEmitter, ProgressEvent,
 };
 pub use services::fe3::FE3Handler;
+#[cfg(not(target_arch = "wasm32"))]
+pub use services::sfs::{
+    SfsAppDownloadInfo, SfsApplicability, SfsClient, SfsConfig, SfsContentId, SfsDownloadUrl,
+    SfsError, SfsFile, SfsFileMetadata, SfsPrerequisite, SfsTargetingAttributes, SfsVersion,
+};
 
 // utilities
 pub use utilities::helpers::{

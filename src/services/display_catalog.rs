@@ -823,6 +823,78 @@ impl DisplayCatalogHandler {
     // Package resolution via FE3
     // -----------------------------------------------------------------------
 
+    /// Resolve SFS app files and declared prerequisites for this product.
+    /// Ambiguous delivery categories require explicit selection with `SfsClient`.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_sfs_download_info(
+        &self,
+    ) -> Result<super::sfs::SfsAppDownloadInfo, super::sfs::SfsError> {
+        self.get_sfs_download_info_with_cancel(&Default::default(), None)
+            .await
+    }
+
+    /// SFS resolution with caller targeting attributes and cancellation.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn get_sfs_download_info_with_cancel(
+        &self,
+        attributes: &super::sfs::SfsTargetingAttributes,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<super::sfs::SfsAppDownloadInfo, super::sfs::SfsError> {
+        let category = self.sfs_category_id()?;
+        let config = super::sfs::SfsConfig {
+            http: self.config.clone(),
+            ..Default::default()
+        };
+        let client = super::sfs::SfsClient::with_client(self.client.clone(), config)?;
+        client
+            .get_latest_app_download_info_with_cancel(category, attributes, cancel)
+            .await
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn sfs_category_id(&self) -> Result<&str, super::sfs::SfsError> {
+        use super::sfs::SfsError;
+        if !self.is_found {
+            return Err(SfsError::InvalidInput("no successful product lookup"));
+        }
+        let product = self
+            .product()
+            .ok_or(SfsError::InvalidInput("no product metadata"))?;
+        let mut categories = std::collections::BTreeSet::new();
+        for availability in product.display_sku_availabilities.as_deref().unwrap_or(&[]) {
+            if let Some(properties) = availability
+                .sku
+                .as_ref()
+                .and_then(|sku| sku.properties.as_ref())
+            {
+                for fulfillment in properties.fulfillment_data.iter().chain(
+                    properties
+                        .packages
+                        .as_deref()
+                        .unwrap_or(&[])
+                        .iter()
+                        .filter_map(|package| package.fulfillment_data.as_ref()),
+                ) {
+                    if let Some(category) = fulfillment
+                        .wu_category_id
+                        .as_deref()
+                        .filter(|id| !id.is_empty())
+                    {
+                        categories.insert(category);
+                    }
+                }
+            }
+        }
+        if categories.len() > 1 {
+            return Err(SfsError::InvalidInput(
+                "multiple delivery categories; select one explicitly with SfsClient",
+            ));
+        }
+        categories.into_iter().next().ok_or(SfsError::InvalidInput(
+            "product has no SFS delivery category",
+        ))
+    }
+
     /// Resolve the direct download URLs for the currently-loaded product.
     ///
     /// Requires `query_dcat` to have been called successfully first.
@@ -1374,6 +1446,24 @@ mod tests {
         h.product_listing = Some(model);
         h.is_found = true;
         h
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn sfs_category_requires_success_and_unambiguous_delivery_category() {
+        assert!(DisplayCatalogHandler::production()
+            .sfs_category_id()
+            .is_err());
+        let h = handler_with_listing(
+            r#"{"Product":{"DisplaySkuAvailabilities":[{"Sku":{"Properties":{"FulfillmentData":{"WuCategoryId":"one"},"Packages":[{"FulfillmentData":{"WuCategoryId":"one"}}]}}}]}}"#,
+        );
+        assert_eq!(h.sfs_category_id().unwrap(), "one");
+        let h = handler_with_listing(
+            r#"{"Product":{"DisplaySkuAvailabilities":[{"Sku":{"Properties":{"FulfillmentData":{"WuCategoryId":"one"},"Packages":[{"FulfillmentData":{"WuCategoryId":"two"}}]}}}]}}"#,
+        );
+        assert!(h.sfs_category_id().is_err());
+        let h = handler_with_listing(r#"{"Product":{}}"#);
+        assert!(h.sfs_category_id().is_err());
     }
 
     #[test]

@@ -396,6 +396,47 @@ cargo build --release --features ffi
 # Header is at include/storelib_rs.h
 ```
 
+## Native Rust SFS backend
+
+The fork also supports Microsoft's SFS Store app service alongside FE3:
+
+```rust,no_run
+use storelib_rs::SfsClient;
+use std::collections::BTreeMap;
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let client = SfsClient::new()?;
+let info = client.get_latest_app_download_info(
+    "b5105a40-6423-4c74-9c74-49610e83bc05", // Windows Terminal WuCategoryId
+    &BTreeMap::new(),
+).await?;
+for file in &info.files {
+    // Persist metadata if needed; expose the temporary URL only to the downloader.
+    let metadata = serde_json::to_string(&file.metadata)?;
+    let download_url = file.download_url.as_str();
+}
+# Ok(()) }
+```
+
+After a successful catalog lookup, `DisplayCatalogHandler::get_sfs_download_info()`
+resolves its unique delivery category. Ambiguous categories require an explicit
+`SfsClient` request. Run `cargo run --locked --example sfs -- 9N0DX20HK701` for a
+live metadata example that does not print download URLs.
+
+The API supports latest app selection with targeting attributes, exact version
+metadata, exact download metadata, and files for declared prerequisites. It retains
+architecture/platform strings for caller-side selection. This does not select an
+installable package set, recursively infer dependencies, install apps, or provide
+licenses. SFS is currently available through the native Rust API; JS and C bindings
+remain unchanged. The fork retains its GPL-3.0-only license.
+
+`SfsConfig` bounds response bytes, prerequisite counts, timeout, and retries.
+Cancellation interrupts requests and backoff. `Retry-After` beyond the configured
+backoff cap returns an HTTP error with the requested delay. `with_client` supports
+custom TLS/proxy clients; callers must preserve certificate verification and safe
+redirect policy. The catalog helper inherits its handler's HTTP policy. Temporary
+URLs are redacted in debug output and excluded from serializable file metadata.
+
 ## License
 
 This program is free software: you can redistribute it and/or modify it under the terms of the
